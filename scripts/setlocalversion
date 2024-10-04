@@ -154,7 +154,7 @@ if test ! "$srctree" -ef .; then
 fi
 
 # CONFIG_LOCALVERSION and LOCALVERSION (if set)
-res="${res}${CONFIG_LOCALVERSION}${LOCALVERSION}_$(git rev-parse --abbrev-ref HEAD)"
+res="${res}${CONFIG_LOCALVERSION}${LOCALVERSION}_$(git -C "$srctree" rev-parse --abbrev-ref HEAD)"
 
 # scm version string if not at a tagged commit
 if test "$CONFIG_LOCALVERSION_AUTO" = "y"; then
