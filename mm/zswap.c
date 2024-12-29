@@ -103,7 +103,7 @@ static struct kernel_param_ops zswap_enabled_param_ops = {
 module_param_cb(enabled, &zswap_enabled_param_ops, &zswap_enabled, 0644);
 
 /* Crypto compressor to use */
-#define ZSWAP_COMPRESSOR_DEFAULT "lzo"
+#define ZSWAP_COMPRESSOR_DEFAULT "zstd"
 #if IS_ENABLED(CONFIG_CRYPTO_ZSTD)
 #define ZSWAP_COMPRESSOR "zstd"
 #else

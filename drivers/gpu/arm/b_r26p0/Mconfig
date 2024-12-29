@@ -98,7 +98,7 @@ config MALI_ARBITER_SUPPORT
 menuconfig MALI_EXPERT
 	depends on MALI_MIDGARD
 	bool "Enable Expert Settings"
-	default y
+	default n
 	help
 	  Enabling this option and modifying the default settings may produce a driver with performance or
 	  other limitations.

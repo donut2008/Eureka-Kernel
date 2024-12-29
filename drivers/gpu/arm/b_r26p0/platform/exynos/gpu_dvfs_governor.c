@@ -205,7 +205,7 @@ static int gpu_dvfs_governor_booster(struct exynos_context *platform, int utiliz
 
 	cur_weight = platform->cur_clock*utilization;
 	/* booster_threshold = current clock * set the percentage of utilization */
-	booster_threshold = platform->cur_clock * 50;
+	booster_threshold = platform->cur_clock * 10;
 
 	dvfs_table_lock = gpu_dvfs_get_level(platform->gpu_max_clock);
 
